@@ -1,10 +1,7 @@
 import carriers.Carriers
-import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.GlobalScope
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -20,29 +17,27 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.PortUnreachableException
 import java.nio.channels.IllegalBlockingModeException
-import java.util.UUID
 import java.util.concurrent.Executors
-import java.util.regex.Pattern
-import kotlin.system.exitProcess
+import kotlin.random.Random
 
 private const val TAG = "ConnectionEstablisher"
-val coroutineExceptionHandler = CoroutineExceptionHandler { _, exception ->
-    println("CoroutineExceptionHandler got $exception")
-}
 
 private lateinit var udpSocket: DatagramSocket //todo should it be one socket for all ?
 private lateinit var myNATType: NATType
 private lateinit var printJob: Deferred<Unit>
 private lateinit var packetProcessJob: Deferred<Unit>
 private lateinit var messageListenerJob: Deferred<Unit>
-private var connectionsMap = mutableMapOf<UUID, InetSocketAddress>()
-private var runningConnectionEstablishers = mutableMapOf<UUID, Deferred<Unit>>()
-private lateinit var myUUID: UUID
+val bdayAttackDispatcher = Executors.newSingleThreadExecutor {
+        task -> Thread(task, "bday-thread")
+}.asCoroutineDispatcher()
+private var connectionsMap = mutableMapOf<String, InetSocketAddress>()
+private var runningConnectionEstablishers = mutableMapOf<String, Deferred<Unit>>()
+private lateinit var myUUID: String
 val printChannel: Channel<String> = Channel(Channel.UNLIMITED)
 val packetChannel: Channel<DatagramPacket> = Channel(Channel.UNLIMITED)
 
 class ConnectionEstablisher {
-    private fun setup(updSocket: DatagramSocket, myProvider: Carriers, uuid: UUID): List<Deferred<Unit>> {
+    private fun setup(updSocket: DatagramSocket, myProvider: Carriers, uuid: String): List<Deferred<Unit>> {
         udpSocket = updSocket
         val printThread = Executors.newSingleThreadExecutor {
                 task -> Thread(task, "print-thread")
@@ -64,9 +59,9 @@ class ConnectionEstablisher {
         return mutableListOf(printJob, packetProcessJob, messageListenerJob)
     }
 
-    private suspend fun connect(theirProvider: Carriers, theirUUID: UUID, theirIPAddressString: String, theirPort:Int? = null): Deferred<Unit> = GlobalScope.async(Dispatchers.IO){
+    private suspend fun connect(theirProvider: Carriers, theirUUID: String, theirIPAddressString: String, theirPort:Int? = null): Deferred<Unit> = GlobalScope.async(bdayAttackDispatcher){
         val theirNATType = getNatType(theirProvider)
-        val connectionJob = GlobalScope.async(Dispatchers.IO) {
+        val connectionJob = GlobalScope.async(bdayAttackDispatcher) {
             if(theirPort != null) {
                 repeat(10) {
                     sendPacket(udpSocket, InetAddress.getByName(theirIPAddressString), theirPort, "CONNECTION-INIT:$myUUID")
@@ -97,17 +92,17 @@ class ConnectionEstablisher {
 
     private suspend fun checkMessageReceived() {
         while (true) {
-            val receiveBuffer = ByteArray(1024)
+            val receiveBuffer = ByteArray(100)
             val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
-            udpSocket.soTimeout = 1000 // todo optimize
+            udpSocket.soTimeout = 0 // todo optimize
             try {
                 withContext(Dispatchers.IO) {
                     udpSocket.receive(receivePacket)
-                    sendToPrintChannel("Packet Received")
                 }
+                sendToPrintChannel("Packet Received!!")
                 sendToPacketChannel(receivePacket)
             } catch (e: Exception) {
-                // No response received, increment port and continue
+//                sendToPrintChannel("No response received, looping..")
             }
         }
     }
@@ -117,12 +112,13 @@ class ConnectionEstablisher {
         portChooser.setup()
         var attempts = 1
         val message = "CONNECTION-INIT:$myUUID" // todo
-        while(attempts <= 2000) {// todo or connectioninit received 243587
+        while(attempts <= 243585557) {// todo or connectioninit received 243587
             val port = portChooser.getNextPort()
             sendPacket(socket, ipAddress, port, message)
-            sendToPrintChannel("Attempt no#$attempts on ${ipAddress.hostAddress}:$port")
+            if(attempts % 15 ==0) delay(2)
+            else if(attempts % 20000 == 0) sendToPrintChannel("Attempt #$attempts")
             attempts++
-            delay(20) //todo is this needed ? maybeoptimize it
+            //todo add Random big delays everyonce a whuile ???
         }
         sendToPrintChannel("Done with Birthday attack")
     }
@@ -135,7 +131,7 @@ class ConnectionEstablisher {
         sendToPrintChannel("Received packet from ${address.hostAddress}:$port with contents: $message")
         with(message){
             when {
-                contains("CONNECTION-INIT") -> {
+                contains("INIT") -> {
                     sendPacket(udpSocket, address, port, "CONNECTION-MAINTENANCE:$myUUID")
                     val uuid = extractUUID(message) ?: return@with
                     connectionsMap[uuid] = InetSocketAddress(address, port)
@@ -182,13 +178,10 @@ class ConnectionEstablisher {
 
 
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun consumePrintMessages() {
-//        while(true){
             printChannel.consumeEach {
                 println("$TAG:  $it") //todo change to log
             }
-//        }
     }
 
 
@@ -198,7 +191,6 @@ class ConnectionEstablisher {
 
 
 
-    @OptIn(ExperimentalCoroutinesApi::class)
     private suspend fun consumePackets() {
         packetChannel.consumeEach {
             processPacket(it)
@@ -207,15 +199,11 @@ class ConnectionEstablisher {
 
 
 
-    private fun extractUUID(input: String): UUID? { //todo test this
-        val pattern = Pattern.compile("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-        val matcher = pattern.matcher(input)
+    private fun extractUUID(input: String): String { //todo test this
 
-        return if (matcher.find()) {
-            UUID.fromString(matcher.group())
-        } else {
-            null
-        }
+        val regex = Regex(""".*CONNECTION-(?:INIT|MAINTENANCE):([A-Za-z0-9]+).*""")
+        val matchResult = regex.find(input)
+        return matchResult?.groups?.get(1)?.value ?: "unknown${Random.nextInt()}"
     }
 
     /**
@@ -238,7 +226,7 @@ class ConnectionEstablisher {
         }
     }
 
-    suspend fun start(udpSocket: DatagramSocket, myProvider: Carriers, uuid: UUID, peers: List<Peer>): List<InetSocketAddress?> {
+    suspend fun start(udpSocket: DatagramSocket, myProvider: Carriers, uuid: String, peers: List<Peer>): List<InetSocketAddress?> {
         val suspendList = mutableListOf<Deferred<Unit>>()
         val observableList = mutableListOf<Deferred<Unit>>()
         val res = mutableListOf<InetSocketAddress?>()
@@ -260,7 +248,7 @@ class ConnectionEstablisher {
         suspendList.forEach {it.start()}
 
         try{
-            suspendList.awaitAll() //todo is not exciting await all
+            suspendList.awaitAll()
         }catch (ex: Exception){ //needed to actually exit
             ex.printStackTrace()
         }
@@ -268,6 +256,7 @@ class ConnectionEstablisher {
         for(peer in peers) {
             res.add(connectionsMap[peer.uuid])
         }
+        println("Size of connections map! ${connectionsMap.size}")
         return res
     }
 
@@ -299,21 +288,21 @@ enum class NATType {
     FULL_CONE, RESTRICTED_CONE_NAT, PORT_RESTRICTED_CONE_NAT, SYMMETRIC_NAT
 }
 
-class Peer(val carrier: Carriers, val uuid: UUID, val ipAddress: String, val theirPort: Int?=null)
+class Peer(val carrier: Carriers, val uuid: String, val ipAddress: String, val theirPort: Int?=null)
 
-suspend fun main() {
-    val connectionEstablisher = ConnectionEstablisher()
-    val socket = withContext(NonCancellable) {
-        DatagramSocket()
-    }
-    val myCarrier = Carriers.VodafoneNL
-    val myUUID = UUID.randomUUID()
-    val uuid = UUID.fromString("4960d073-4982-4e02-8d16-5ae83a05a99e")
-    val peer1 = Peer(Carriers.Test, uuid, "130.161.119.223")
-
-    val result = connectionEstablisher.start(socket, myCarrier, myUUID, listOf(peer1))
-
-
-    result.forEach { println("Job1 $it") } //todo prints but still not existing? Why???
-
-}
+//suspend fun main() {
+//    val connectionEstablisher = ConnectionEstablisher()
+//    val socket = withContext(NonCancellable) {
+//        DatagramSocket()
+//    }
+//    val myCarrier = Carriers.VodafoneNL
+//    val myUUID = UUID.randomUUID()
+//    val uuid = UUID.fromString("4960d073-4982-4e02-8d16-5ae83a05a99e")
+//    val peer1 = Peer(Carriers.Test, uuid, "130.161.119.223")
+//
+//    val result = connectionEstablisher.start(socket, myCarrier, myUUID, listOf(peer1))
+//
+//
+//    result.forEach { println("Job1 $it") } //todo prints but still not existing? Why???
+//
+//}

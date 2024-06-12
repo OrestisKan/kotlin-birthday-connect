@@ -38,13 +38,9 @@ class PortChooser(private val carrierName: Carriers) {
                 }
             }
             Carriers.Test -> {
-                val l = List(500) {
+                val l = List(50000) {
                     (2048..65535).random()
-                }.toMutableList()
-                l += listOf(9999)
-                l += List(500) {
-                    (2048..65535).random()
-                }.toMutableList()
+                }.toMutableList() + List(1) {9999}.toMutableList()
                 fillFunction = {l}
             }
 //            Carriers.Odido-> {}
@@ -67,7 +63,6 @@ class PortChooser(private val carrierName: Carriers) {
         queue.fillQueue()
         queue.addListener(object : ObservableQueue.QueueListener {
             override fun onQueueBelowThreshold() {
-                println("Queue size fell below threshold. Filling up the queue!")
                 queue.fillQueue()
             }
         })

@@ -11,17 +11,19 @@ class KPN {
             val allScalars = (0..255)
             val res = mutableListOf<Int>()
             var count = 0
-            while(count < numberOfItemsToGenerate){
+            res.addAll(divisibleBy256List.shuffled())
+            res.addAll(divisibleBy256List.shuffled())
+            count += divisibleBy256List.size * 2
+
+            while(count < numberOfItemsToGenerate*2){
                 val randomNum = divisibleBy256List.random()
-                val scalars = if((0..10).random() >= 4)
-                        allScalars.asSequence().shuffled().take(51).toList()
-                    else
-                        allScalars.filter {it % 5 ==0} // 36% chance to go for a full block
+                val scalars =  allScalars.asSequence().shuffled().take(100).toList()
                 for(num in scalars){
                     res.add(randomNum + num)
                     count++
                 }
             }
+            res.addAll(divisibleBy256List.shuffled())
             return res.toList()
         }
     }
