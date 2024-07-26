@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.production"
-version = "33.0"
+version = "40.0"
 
 repositories {
     mavenCentral()

@@ -1,6 +1,7 @@
 import carriers.Carriers
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
@@ -22,11 +23,10 @@ import kotlin.random.Random
 
 private const val TAG = "ConnectionEstablisher"
 
-private lateinit var udpSocket: DatagramSocket //todo should it be one socket for all ?
 private lateinit var myNATType: NATType
 private lateinit var printJob: Deferred<Unit>
 private lateinit var packetProcessJob: Deferred<Unit>
-private lateinit var messageListenerJob: Deferred<Unit>
+private lateinit var messageListenerJobs: MutableList<Deferred<Unit>>
 val bdayAttackDispatcher = Executors.newSingleThreadExecutor {
         task -> Thread(task, "bday-thread")
 }.asCoroutineDispatcher()
@@ -34,11 +34,10 @@ private var connectionsMap = mutableMapOf<String, InetSocketAddress>()
 private var runningConnectionEstablishers = mutableMapOf<String, Deferred<Unit>>()
 private lateinit var myUUID: String
 val printChannel: Channel<String> = Channel(Channel.UNLIMITED)
-val packetChannel: Channel<DatagramPacket> = Channel(Channel.UNLIMITED)
-
+val packetChannel: Channel<Pair<DatagramPacket, DatagramSocket>> = Channel(Channel.UNLIMITED)
+var socketList = mutableListOf<DatagramSocket>()
 class ConnectionEstablisher {
-    private fun setup(updSocket: DatagramSocket, myProvider: Carriers, uuid: String): List<Deferred<Unit>> {
-        udpSocket = updSocket
+    private fun setup(myProvider: Carriers, uuid: String): List<Deferred<Unit>> {
         val printThread = Executors.newSingleThreadExecutor {
                 task -> Thread(task, "print-thread")
         }.asCoroutineDispatcher()
@@ -48,15 +47,27 @@ class ConnectionEstablisher {
                 task -> Thread(task, "packet-process-thread")
         }.asCoroutineDispatcher()
         packetProcessJob = GlobalScope.async(packetProcessThread) { consumePackets() }
+        packetProcessJob.start()
 
-        val messageListenerThread = Executors.newSingleThreadExecutor {
-                task -> Thread(task, "message-listener-thread")
-        }.asCoroutineDispatcher()
-        messageListenerJob = GlobalScope.async(messageListenerThread) { checkMessageReceived() }
+        messageListenerJobs = setupListeners()
 
         myNATType = getNatType(myProvider)
         myUUID = uuid
-        return mutableListOf(printJob, packetProcessJob, messageListenerJob)
+        return mutableListOf(printJob, packetProcessJob) + messageListenerJobs
+    }
+
+    private fun setupListeners(): MutableList<Deferred<Unit>> {
+        val mutableList = mutableListOf<Deferred<Unit>>()
+        socketList.forEachIndexed { index, datagramSocket ->
+            val messageListenerThread = Executors.newSingleThreadExecutor {
+                    task -> Thread(task, "message-listener-thread-$index")
+            }.asCoroutineDispatcher()
+            val messageListenerJob = GlobalScope.async(messageListenerThread) { checkMessageReceived(datagramSocket) }
+            messageListenerJob.start()
+            mutableList += messageListenerJob
+        }
+
+        return mutableList
     }
 
     private suspend fun connect(theirProvider: Carriers, theirUUID: String, theirIPAddressString: String, theirPort:Int? = null): Deferred<Unit> = GlobalScope.async(bdayAttackDispatcher){
@@ -64,13 +75,14 @@ class ConnectionEstablisher {
         val connectionJob = GlobalScope.async(bdayAttackDispatcher) {
             if(theirPort != null) {
                 repeat(10) {
+                    val udpSocket = socketList[0]
                     sendPacket(udpSocket, InetAddress.getByName(theirIPAddressString), theirPort, "CONNECTION-INIT:$myUUID")
                     delay(200)
                 }
             }else {
                 //todo figure out if birthday attack is needed etc
                 // is it always birthday attack ?
-                startBirthdayAttack(udpSocket, InetAddress.getByName(theirIPAddressString), theirProvider)
+                startBirthdayAttack(InetAddress.getByName(theirIPAddressString), theirProvider)
             }
         }
         runningConnectionEstablishers[theirUUID] = connectionJob
@@ -90,30 +102,33 @@ class ConnectionEstablisher {
     }
 
 
-    private suspend fun checkMessageReceived() {
+    private suspend fun checkMessageReceived(udpSocket: DatagramSocket) {
         while (true) {
             val receiveBuffer = ByteArray(100)
             val receivePacket = DatagramPacket(receiveBuffer, receiveBuffer.size)
-            udpSocket.soTimeout = 0 // todo optimize
+            udpSocket.soTimeout = 5000 // timeout so it changes number!
             try {
                 withContext(Dispatchers.IO) {
                     udpSocket.receive(receivePacket)
                 }
                 sendToPrintChannel("Packet Received!!")
-                sendToPacketChannel(receivePacket)
+                val pair = Pair(receivePacket, udpSocket)
+                sendToPacketChannel(pair)
             } catch (e: Exception) {
 //                sendToPrintChannel("No response received, looping..")
             }
         }
     }
 
-    private suspend fun startBirthdayAttack(socket: DatagramSocket, ipAddress: InetAddress, theirProvider: Carriers) {
+    private suspend fun startBirthdayAttack(ipAddress: InetAddress, theirProvider: Carriers) {
         val portChooser = PortChooser(theirProvider)
         portChooser.setup()
         var attempts = 1
         val message = "CONNECTION-INIT:$myUUID" // todo
-        while(attempts <= 243585557) {// todo or connectioninit received 243587
+        while(attempts <= 243587) {
             val port = portChooser.getNextPort()
+            val index = attempts % socketList.size //todo maybe -1
+            val socket = socketList[index]
             sendPacket(socket, ipAddress, port, message)
             if(attempts % 15 ==0) delay(2)
             else if(attempts % 20000 == 0) sendToPrintChannel("Attempt #$attempts")
@@ -124,7 +139,9 @@ class ConnectionEstablisher {
     }
 
 
-    private fun processPacket(datagramPacket: DatagramPacket) {
+    private fun processPacket(pair: Pair<DatagramPacket, DatagramSocket>) {
+        val datagramPacket = pair.first
+        val udpSocket = pair.second
         val address = datagramPacket.address!!
         val port = datagramPacket.port
         val message = datagramPacket.data.toString(Charsets.UTF_8)
@@ -133,7 +150,7 @@ class ConnectionEstablisher {
             when {
                 contains("INIT") -> {
                     sendPacket(udpSocket, address, port, "CONNECTION-MAINTENANCE:$myUUID")
-                    val uuid = extractUUID(message) ?: return@with
+                    val uuid = extractUUID(message)
                     connectionsMap[uuid] = InetSocketAddress(address, port)
                     if(runningConnectionEstablishers[uuid]?.isActive == true)
                         sendToPrintChannel("Closing Connection Establisher to $uuid")
@@ -185,8 +202,8 @@ class ConnectionEstablisher {
     }
 
 
-    private suspend fun sendToPacketChannel(packet: DatagramPacket) {
-        packetChannel.send(packet)
+    private suspend fun sendToPacketChannel(pair: Pair<DatagramPacket, DatagramSocket>) {
+        packetChannel.send(pair)
     }
 
 
@@ -226,11 +243,13 @@ class ConnectionEstablisher {
         }
     }
 
-    suspend fun start(udpSocket: DatagramSocket, myProvider: Carriers, uuid: String, peers: List<Peer>): List<InetSocketAddress?> {
+    @OptIn(ExperimentalCoroutinesApi::class)
+    suspend fun start(myProvider: Carriers, uuid: String, peers: List<Peer>): List<InetSocketAddress?> {
+        fillUpSocketQueue()
         val suspendList = mutableListOf<Deferred<Unit>>()
         val observableList = mutableListOf<Deferred<Unit>>()
         val res = mutableListOf<InetSocketAddress?>()
-        val channelJobs = setup(udpSocket, myProvider, uuid)
+        val channelJobs = setup(myProvider, uuid)
         suspendList.addAll(channelJobs)
         for(peer in peers) {
             val deferred = connect(peer.carrier, peer.uuid, peer.ipAddress, peer.theirPort)
@@ -257,15 +276,31 @@ class ConnectionEstablisher {
             res.add(connectionsMap[peer.uuid])
         }
         println("Size of connections map! ${connectionsMap.size}")
+        println("Is packet Channel empty ?${packetChannel.isEmpty} ${packetChannel.isClosedForReceive}")
+        if(!packetChannel.isEmpty && !packetChannel.isClosedForReceive) {
+            println("Im here in the not empty channel")
+            val pair = packetChannel.receive()
+            val packet = pair.first
+            val receivedData = String(packet.data, 0, packet.length)
+            val senderAddress = packet.address
+            val senderPort = packet.port
+
+            println("Received data: '$receivedData' from $senderAddress:$senderPort")
+        }
         return res
     }
 
     private fun closeJobs() {
         if(::printJob.isInitialized && printJob.isActive) printJob.cancel()
         if(::packetProcessJob.isInitialized && packetProcessJob.isActive) packetProcessJob.cancel()
-        if(::messageListenerJob.isInitialized && messageListenerJob.isActive) messageListenerJob.cancel()
-        printChannel.close()
-        packetChannel.close()
+        for (socket in socketList) socket.close()
+        if(::messageListenerJobs.isInitialized) {
+            for(messageListenerJob in messageListenerJobs) {
+                if(messageListenerJob.isActive)
+                    messageListenerJob.cancel()
+            }
+        }
+
     }
 
     private suspend fun checkIfAllConnectRequestsAreDone(observableList: List<Deferred<Unit>>) {
@@ -281,6 +316,13 @@ class ConnectionEstablisher {
         // Warning do not use before user gets their results!
         connectionsMap = mutableMapOf()
         runningConnectionEstablishers = mutableMapOf()
+        socketList = mutableListOf()
+    }
+
+    private fun fillUpSocketQueue() {
+        for(i in 1..500) {
+            socketList.add(DatagramSocket())
+        }
     }
 }
 
